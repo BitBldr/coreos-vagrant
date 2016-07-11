@@ -8,6 +8,42 @@ Vagrant.require_version ">= 1.6.0"
 CLOUD_CONFIG_PATH = File.join(File.dirname(__FILE__), "user-data")
 CONFIG = File.join(File.dirname(__FILE__), "config.rb")
 
+module OS
+  def OS.windows?
+    (/cygwin|mswin|mingw|bccwin|wince|emx/ =~ RUBY_PLATFORM) != nil
+  end
+
+  def OS.mac?
+   (/darwin/ =~ RUBY_PLATFORM) != nil
+  end
+
+  def OS.unix?
+    !OS.windows?
+  end
+
+  def OS.linux?
+    OS.unix? and not OS.mac?
+  end
+end
+
+
+required_plugins = %w(vagrant-triggers)
+
+if OS.windows?
+  required_plugins.push('vagrant-winnfsd')
+end
+
+required_plugins.push('vagrant-timezone')
+
+required_plugins.each do |plugin|
+  need_restart = false
+  unless Vagrant.has_plugin? plugin
+    system "vagrant plugin install #{plugin}"
+    need_restart = true
+  end
+  exec "vagrant #{ARGV.join(' ')}" if need_restart
+end
+
 # Defaults for config options defined in CONFIG
 $num_instances = 1
 $instance_name_prefix = "core"
@@ -21,6 +57,7 @@ $vm_cpus = 1
 $vb_cpuexecutioncap = 100
 $shared_folders = {}
 $forwarded_ports = {}
+$public_ssh = true
 
 # Attempt to apply the deprecated environment variable NUM_INSTANCES to
 # $num_instances while allowing config.rb to override it
@@ -46,8 +83,12 @@ def vm_cpus
 end
 
 Vagrant.configure("2") do |config|
-  # always use Vagrants insecure key
-  config.ssh.insert_key = false
+  # always use host timezone in VMs
+  config.timezone.value = :host
+
+  # do not use Vagrants insecure key
+  config.ssh.insert_key = true
+
   # forward ssh agent to easily ssh into the different machines
   config.ssh.forward_agent = true
 
@@ -76,8 +117,8 @@ Vagrant.configure("2") do |config|
   end
 
   (1..$num_instances).each do |i|
-    config.vm.define vm_name = "%s-%02d" % [$instance_name_prefix, i] do |config|
-      config.vm.hostname = vm_name
+    config.vm.define vm_name = "%s-%02d" % [$instance_name_prefix, i] do |kHost|
+      kHost.vm.hostname = vm_name
 
       if $enable_serial_logging
         logdir = File.join(File.dirname(__FILE__), "log")
@@ -87,7 +128,7 @@ Vagrant.configure("2") do |config|
         FileUtils.touch(serialFile)
 
         ["vmware_fusion", "vmware_workstation"].each do |vmware|
-          config.vm.provider vmware do |v, override|
+          kHost.vm.provider vmware do |v, override|
             v.vmx["serial0.present"] = "TRUE"
             v.vmx["serial0.fileType"] = "file"
             v.vmx["serial0.fileName"] = serialFile
@@ -95,51 +136,70 @@ Vagrant.configure("2") do |config|
           end
         end
 
-        config.vm.provider :virtualbox do |vb, override|
+        kHost.vm.provider :virtualbox do |vb, override|
           vb.customize ["modifyvm", :id, "--uart1", "0x3F8", "4"]
           vb.customize ["modifyvm", :id, "--uartmode1", serialFile]
         end
       end
 
       if $expose_docker_tcp
-        config.vm.network "forwarded_port", guest: 2375, host: ($expose_docker_tcp + i - 1), host_ip: "127.0.0.1", auto_correct: true
+        kHost.vm.network "forwarded_port", guest: 2375, host: ($expose_docker_tcp + i - 1), host_ip: "127.0.0.1", auto_correct: true
       end
 
       $forwarded_ports.each do |guest, host|
-        config.vm.network "forwarded_port", guest: guest, host: host, auto_correct: true
+        kHost.vm.network "forwarded_port", guest: guest, host: host, auto_correct: true
       end
 
       ["vmware_fusion", "vmware_workstation"].each do |vmware|
-        config.vm.provider vmware do |v|
+        kHost.vm.provider vmware do |v|
           v.gui = vm_gui
           v.vmx['memsize'] = vm_memory
           v.vmx['numvcpus'] = vm_cpus
         end
       end
 
-      config.vm.provider :virtualbox do |vb|
+      kHost.vm.provider :virtualbox do |vb|
         vb.gui = vm_gui
         vb.memory = vm_memory
         vb.cpus = vm_cpus
         vb.customize ["modifyvm", :id, "--cpuexecutioncap", "#{$vb_cpuexecutioncap}"]
       end
 
+      # configure private network interface
       ip = "172.17.8.#{i+100}"
-      config.vm.network :private_network, ip: ip
+      kHost.vm.network :private_network, ip: ip
+
+      # configure public network interface
+      kHost.vm.network :public_network, auto_config: false
 
       # Uncomment below to enable NFS for sharing the host machine into the coreos-vagrant VM.
       #config.vm.synced_folder ".", "/home/core/share", id: "core", :nfs => true, :mount_options => ['nolock,vers=3,udp']
       $shared_folders.each_with_index do |(host_folder, guest_folder), index|
-        config.vm.synced_folder host_folder.to_s, guest_folder.to_s, id: "core-share%02d" % index, nfs: true, mount_options: ['nolock,vers=3,udp']
+        kHost.vm.synced_folder host_folder.to_s, guest_folder.to_s, id: "core-share%02d" % index, nfs: true, mount_options: ['nolock,vers=3,udp']
       end
 
       if $share_home
-        config.vm.synced_folder ENV['HOME'], ENV['HOME'], id: "home", :nfs => true, :mount_options => ['nolock,vers=3,udp']
+        kHost.vm.synced_folder ENV['HOME'], ENV['HOME'], id: "home", :nfs => true, :mount_options => ['nolock,vers=3,udp']
       end
 
       if File.exist?(CLOUD_CONFIG_PATH)
-        config.vm.provision :file, :source => "#{CLOUD_CONFIG_PATH}", :destination => "/tmp/vagrantfile-user-data"
-        config.vm.provision :shell, :inline => "mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant/", :privileged => true
+        kHost.vm.provision :file, :source => "#{CLOUD_CONFIG_PATH}", :destination => "/tmp/vagrantfile-user-data"
+        kHost.vm.provision :shell, :inline => "mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant/", :privileged => true
+      end
+
+      kHost.trigger.after [:up] do
+        if $public_ssh
+          info "#{vm_name} SSH available for 'core' user at IP Address:"
+          run_remote "ifconfig eth2 | grep 'inet ' | cut -d: -f2 | awk '{ print $2}'"
+          FileUtils.mkdir_p("#{__dir__}/keys")
+          FileUtils.cp("#{__dir__}/.vagrant/machines/#{vm_name}/virtualbox/private_key", "#{__dir__}/keys/#{vm_name}_private_key")
+          info "Use vagrant generated private key located at '#{__dir__}/keys/#{vm_name}_private_key'"
+        end
+      end
+
+      # clean keys directory after vm is destroyed
+      kHost.trigger.after [:destroy] do
+        FileUtils.rm_rf(Dir.glob("#{__dir__}/keys/*"))
       end
 
     end
